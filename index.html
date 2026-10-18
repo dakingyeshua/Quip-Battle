@@ -46,6 +46,9 @@ button:disabled{opacity:.45}
 #status.ok{background:#1d3d2a;color:#b8f0c8}
 .err-box{background:#5a1a1a;color:#ffd0d0;padding:12px;border-radius:10px;margin:10px 0}
 .winner{font-size:1.6rem;text-align:center;color:#ffcc33;font-weight:800;margin:10px 0}
+#fatal{position:fixed;left:8px;right:8px;top:8px;z-index:60;background:#5c1f2a;color:#fff;border:2px solid #ff6b81;border-radius:12px;padding:12px 14px;font-size:15px;display:none}#fatal button{min-height:40px;padding:6px 14px;margin:8px 8px 0 0;width:auto;display:inline-block}
+#copybox{position:fixed;top:0;left:0;right:0;bottom:0;z-index:50;background:rgba(5,5,15,.8);display:none;align-items:center;justify-content:center;padding:16px}#copybox>div{background:#22223a;border-radius:16px;padding:16px;max-width:520px;width:100%}
+input.invite{font-size:16px;min-height:40px;padding:6px 10px;margin-top:8px;color:#dde;text-align:center}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#333350;color:#fff;padding:10px 18px;border-radius:20px;display:none;z-index:9}
 </style>
 </head>
@@ -53,6 +56,20 @@ button:disabled{opacity:.45}
 <div id="status"></div>
 <div id="app"></div>
 <div id="toast"></div>
+<div id="copybox"><div><b>Copy this invite link</b><input id="copyurl" class="invite" readonly onclick="this.setSelectionRange(0,this.value.length)"><p class="small">Press and hold the link, then tap <b>Copy</b>.</p><button onclick="document.getElementById('copybox').style.display='none'">Done</button></div></div>
+<div id="fatal"></div>
+<script>
+/* Safety net: show a visible error instead of a blank/broken page */
+window.__fatal = function (m, soft) {
+  var f = document.getElementById('fatal'); if (!f || (f.style.display === 'block' && (soft || window.__fatalHard))) return; if (!soft) window.__fatalHard = true;
+  f.innerHTML = '<b>' + (soft ? 'Heads up' : 'Quip Battle hit a problem') + '</b><br>' + String(m).replace(/[<>&]/g, '') +
+    '<br><button onclick="location.reload()">Reload</button><button class="ghost" onclick="this.parentNode.style.display=\'none\'">Dismiss</button>';
+  f.style.display = 'block';
+};
+window.addEventListener('error', function (e) { if (e && e.message) __fatal('Error: ' + e.message); });
+window.addEventListener('unhandledrejection', function (e) { var r = e && e.reason; __fatal('Error: ' + (r && r.message || r)); });
+if (/FBAN|FBAV|FB_IAB|Instagram|Snapchat|Line\/|TikTok|musical_ly|Bytedance/i.test(navigator.userAgent)) setTimeout(function () { __fatal('You are in an in-app browser. If the game misbehaves, tap \u22ef / Share and choose "Open in Safari" (or Chrome).', true); }, 0);
+</script>
 <script>
 'use strict';
 /* ===== Config ===== */
@@ -91,9 +108,19 @@ function shuffle(a) { a = a.slice(); for (var i = a.length - 1; i > 0; i--) { va
 function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
 function save(k, v) { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 function toast(msg) { var t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(function () { t.style.display = 'none'; }, 1800); }
-function copyText(txt) {
-  function fallback() { var ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (e) {} ta.remove(); toast('Copied!'); }
-  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(function () { toast('Copied!'); }, fallback); else fallback();
+function legacyCopy(txt) { // iOS ignores select() on hidden fields: make a real selection range
+  var el = document.createElement('textarea'), sel = window.getSelection(), ok = false;
+  el.value = txt; el.setAttribute('readonly', ''); el.contentEditable = 'true';
+  el.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;margin:0;font-size:16px;opacity:.01';
+  document.body.appendChild(el);
+  try { var r = document.createRange(); r.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(r); el.select(); el.setSelectionRange(0, txt.length); ok = document.execCommand('copy'); } catch (e) { ok = false; }
+  sel.removeAllRanges(); document.body.removeChild(el); return ok;
+}
+function manualCopy(txt) { var i = $('copyurl'); i.value = txt; $('copybox').style.display = 'flex'; i.focus(); i.setSelectionRange(0, txt.length); }
+function copyText(txt) { // call synchronously from the tap; toast only on real success
+  if (!txt) return;
+  var ok = function () { toast('Invite link copied!'); }, fb = function () { if (legacyCopy(txt)) ok(); else manualCopy(txt); };
+  if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) { try { navigator.clipboard.writeText(txt).then(ok, fb); } catch (e) { fb(); } } else fb();
 }
 
 /* ===== Minimal MQTT 3.1.1 over WebSocket (QoS 0) ===== */
@@ -399,7 +426,7 @@ function doJoin() {
 function inviteLink() { return location.origin + location.pathname + '?room=' + S.code; }
 function shareInvite() {
   var link = inviteLink();
-  if (navigator.share) navigator.share({ title: 'Quip Battle', text: 'Join my Quip Battle room ' + S.code, url: link }).catch(function () {});
+  if (navigator.share) navigator.share({ title: 'Quip Battle', text: 'Join my Quip Battle room ' + S.code, url: link }).catch(function (e) { if (!e || e.name !== 'AbortError') manualCopy(link); });
   else copyText(link);
 }
 function scoreList(withOnline) {
@@ -411,8 +438,8 @@ function lobbyView() {
   var n = S.players.length, isHost = !!H;
   return '<h1>Quip <span>Battle</span></h1>' +
     '<div class="card center"><div class="small">Room code</div><div class="code" id="roomcode">' + esc(S.code) + '</div>' +
-    '<div class="row"><button onclick="copyText(S.code)">Copy code</button><button class="alt" onclick="shareInvite()">Share link</button></div>' +
-    '<div class="small" style="margin-top:8px;word-break:break-all">' + esc(inviteLink()) + '</div></div>' +
+    '<div class="row">' + (navigator.share ? '<button onclick="shareInvite()">Share invite</button><button class="alt" onclick="copyText(inviteLink())">Copy link</button>' : '<button onclick="copyText(inviteLink())">Copy invite link</button>') + '</div>' +
+    '<input class="invite" id="invite" readonly value="' + esc(inviteLink()) + '" onclick="this.setSelectionRange(0,this.value.length)" aria-label="Invite link"></div>' +
     '<div class="card"><h2>Players (' + n + '/' + MAX_PLAYERS + ')</h2>' + scoreList(true) + '</div>' +
     (isHost ? '<button id="start" onclick="hostStart()"' + (n < 2 ? ' disabled' : '') + '>' + (n < 2 ? 'Need at least 2 players' : 'Start game (' + ROUNDS + ' rounds)') + '</button>'
             : '<div class="card center" id="waiting">Waiting for host to start\u2026</div>') +
