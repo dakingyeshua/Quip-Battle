@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14141f">
+<title>Quip Battle</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;background:#14141f;color:#eee;font:17px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+#app{max-width:520px;margin:0 auto;padding:12px 16px calc(24px + env(safe-area-inset-bottom))}
+h1{font-size:2rem;margin:.4em 0 .2em;text-align:center;letter-spacing:.5px}
+h1 span{color:#ffcc33}
+h2{font-size:1.3rem;margin:.6em 0}
+.sub{color:#aab;text-align:center;margin:0 0 1em}
+.card{background:#1f1f2e;border-radius:14px;padding:16px;margin:12px 0}
+label{display:block;font-size:.9rem;color:#aab;margin:0 0 6px}
+input,textarea{width:100%;font:inherit;font-size:18px;color:#fff;background:#2a2a3d;border:2px solid #3a3a55;border-radius:10px;padding:12px;min-height:48px}
+input:focus,textarea:focus{outline:none;border-color:#ffcc33}
+textarea{min-height:96px;resize:vertical}
+button{display:block;width:100%;min-height:52px;font:inherit;font-weight:700;font-size:18px;border:0;border-radius:12px;padding:12px;margin:10px 0 0;background:#ffcc33;color:#1a1a1a;cursor:pointer;touch-action:manipulation}
+button.alt{background:#3a3a55;color:#fff}
+button.ghost{background:transparent;color:#aab;border:2px solid #3a3a55}
+button:disabled{opacity:.45}
+.row{display:flex;gap:10px}.row>*{flex:1}
+.code{font:800 3rem/1.1 ui-monospace,Menlo,monospace;letter-spacing:.3em;text-align:center;color:#ffcc33;margin:6px 0}
+.plist{list-style:none;padding:0;margin:0}
+.plist li{display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #2c2c40;min-height:48px}
+.plist li:last-child{border:0}
+.tag{font-size:.75rem;background:#3a3a55;border-radius:6px;padding:2px 8px;margin-left:6px;color:#ccd}
+.off{opacity:.5}
+.prompt{font-size:1.45rem;font-weight:700;text-align:center;padding:18px 8px;color:#fff}
+.timer{text-align:center;font-weight:700;color:#ffcc33;font-size:1.1rem}
+.timer.low{color:#ff6b6b}
+.ans{width:100%;text-align:left;font-weight:600;background:#2a2a3d;color:#fff;border:2px solid #3a3a55;min-height:56px}
+.ans.mine{opacity:.4}
+.ans.picked{border-color:#ffcc33;background:#3b3520}
+.res{padding:12px;border-radius:10px;background:#2a2a3d;margin:8px 0}
+.res b{color:#ffcc33}
+.small{font-size:.85rem;color:#aab}
+.center{text-align:center}
+#status{position:sticky;top:0;z-index:5;text-align:center;font-size:.9rem;padding:8px;border-radius:0 0 10px 10px;display:none}
+#status.show{display:block}
+#status.warn{background:#5a4210;color:#ffe2a0}
+#status.err{background:#5a1a1a;color:#ffc0c0}
+#status.ok{background:#1d3d2a;color:#b8f0c8}
+.err-box{background:#5a1a1a;color:#ffd0d0;padding:12px;border-radius:10px;margin:10px 0}
+.winner{font-size:1.6rem;text-align:center;color:#ffcc33;font-weight:800;margin:10px 0}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#333350;color:#fff;padding:10px 18px;border-radius:20px;display:none;z-index:9}
+</style>
+</head>
+<body>
+<div id="status"></div>
+<div id="app"></div>
+<div id="toast"></div>
+<script>
+'use strict';
+/* ===== Config ===== */
+// Several free public MQTT-over-WebSocket brokers; we use all that connect (publish to each, de-dupe on receive).
+// shiftr.io runs on port 443 (works on networks that block odd ports); the other two are backups.
+var BROKERS = [
+  { url: 'wss://public.cloud.shiftr.io/mqtt', user: 'public', pass: 'public' },
+  { url: 'wss://broker.emqx.io:8084/mqtt' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt' }
+];
+var TOPIC = 'qb7x/';            // topics: qb7x/<CODE>/s (state, retained) and qb7x/<CODE>/a (actions)
+var MAX_PLAYERS = 4, ROUNDS = 5, POINTS = 100;
+var QS = new URLSearchParams(location.search);
+var ANSWER_MS = (+QS.get('ansT') || 60) * 1000, VOTE_MS = (+QS.get('voteT') || 30) * 1000, RESULTS_MS = 12000;
+var HOST_TIMEOUT = 15000, NOT_FOUND_MS = 7000, STALE_ROOM_MS = 90000, OFFLINE_MS = 20000;
+var CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ'; // no I, L, O (and no digits)
+var PROMPTS = [
+  'Worst possible superpower', 'Bad hospital slogan', 'A terrible name for a pet goldfish',
+  'The worst thing to say on a first date', 'A rejected flavor of ice cream', 'What your fridge whispers at night',
+  'A bad slogan for a dentist', 'The worst theme for a kid\u2019s birthday party', 'A suspicious name for a bakery',
+  'The least helpful thing a GPS could say', 'A terrible new Olympic sport', 'What the dog is actually thinking',
+  'The worst thing to find in your burrito', 'A bad motto for an airline', 'The most useless app idea',
+  'What not to write in a wedding card', 'A terrible name for a boat', 'The worst fortune cookie message',
+  'A bad excuse for being late to work', 'The worst thing to yell in a library', 'A rejected Disney movie title',
+  'The weirdest thing to bring to a picnic', 'An awful name for a rock band', 'A bad slogan for a gym',
+  'The worst text to get from your boss at 2am', 'A terrible thing to engrave on a trophy'
+];
+
+/* ===== Small helpers ===== */
+var LOG = []; function dbg(x) { LOG.push(Math.round(performance.now()) + ' ' + x); if (LOG.length > 300) LOG.shift(); }
+function $(id) { return document.getElementById(id); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function rid(n) { var s = '', a = 'abcdefghijkmnpqrstuvwxyz23456789'; for (var i = 0; i < n; i++) s += a[Math.floor(Math.random() * a.length)]; return s; }
+function newCode() { var s = ''; for (var i = 0; i < 4; i++) s += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]; return s; }
+function shuffle(a) { a = a.slice(); for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+function load(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+function save(k, v) { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function toast(msg) { var t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(function () { t.style.display = 'none'; }, 1800); }
+function copyText(txt) {
+  function fallback() { var ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (e) {} ta.remove(); toast('Copied!'); }
+  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(txt).then(function () { toast('Copied!'); }, fallback); else fallback();
+}
+
+/* ===== Minimal MQTT 3.1.1 over WebSocket (QoS 0) ===== */
+var enc = new TextEncoder(), dec = new TextDecoder();
+function mqStr(s) { var b = enc.encode(s); return [b.length >> 8, b.length & 255].concat(Array.from(b)); }
+function mqPacket(type, body) {
+  var len = body.length, hdr = [type];
+  do { var d = len % 128; len = Math.floor(len / 128); if (len > 0) d |= 128; hdr.push(d); } while (len > 0);
+  return new Uint8Array(hdr.concat(body));
+}
+function Broker(cfg, onMsg, onChange) {
+  this.cfg = cfg; this.url = cfg.url; this.onMsg = onMsg; this.onChange = onChange; this.ready = false; this.subs = []; this.retry = 1000; this.connect();
+}
+Broker.prototype.connect = function () {
+  var self = this; clearTimeout(this.rt);
+  if (this.ws) { try { this.ws.onclose = null; this.ws.close(); } catch (e) {} }
+  this.ready = false; this.buf = new Uint8Array(0);
+  var ws; try { ws = new WebSocket(this.url, 'mqtt'); } catch (e) { return this.later(); }
+  this.ws = ws; ws.binaryType = 'arraybuffer';
+  var t = setTimeout(function () { if (!self.ready) { try { ws.close(); } catch (e) {} } }, 8000);
+  ws.onopen = function () {
+    var c = self.cfg, flags = 0x02 | (c.user ? 0xC0 : 0);
+    var body = mqStr('MQTT').concat([4, flags, 0, 30], mqStr('qb' + rid(12)));
+    if (c.user) body = body.concat(mqStr(c.user), mqStr(c.pass || ''));
+    ws.send(mqPacket(0x10, body));
+  };
+  ws.onmessage = function (ev) { self.feed(new Uint8Array(ev.data)); };
+  ws.onerror = function () {};
+  ws.onclose = function (ev) { dbg('close ' + self.url + ' ' + ev.code); clearTimeout(t); clearInterval(self.ping); var was = self.ready; self.ready = false; if (was) self.onChange(); self.later(); };
+};
+Broker.prototype.later = function () { var self = this; this.rt = setTimeout(function () { self.connect(); }, this.retry); this.retry = Math.min(this.retry * 2, 8000); };
+Broker.prototype.feed = function (data) {
+  var b = new Uint8Array(this.buf.length + data.length); b.set(this.buf); b.set(data, this.buf.length);
+  while (b.length >= 2) {
+    var mult = 1, len = 0, i = 1, d;
+    do { if (i >= b.length) { this.buf = b; return; } d = b[i++]; len += (d & 127) * mult; mult *= 128; } while (d & 128);
+    if (b.length < i + len) break;
+    this.packet(b[0], b.subarray(i, i + len)); b = b.slice(i + len);
+  }
+  this.buf = b;
+};
+Broker.prototype.packet = function (h, p) {
+  var type = h >> 4, self = this;
+  if (type === 2) { // CONNACK
+    if (p[1] !== 0) { dbg('connack refused ' + p[1]); this.ws.close(); return; }
+    dbg('up ' + this.url);
+    this.ready = true; this.retry = 1000;
+    this.subs.forEach(function (s) { self.sendSub(s); });
+    this.ping = setInterval(function () { self.send(new Uint8Array([0xC0, 0])); }, 20000);
+    this.onChange();
+  } else if (type === 3) { // PUBLISH
+    var tl = (p[0] << 8) | p[1], topic = dec.decode(p.subarray(2, 2 + tl)), off = 2 + tl;
+    if ((h >> 1) & 3) off += 2;
+    var txt = dec.decode(p.subarray(off)); if (!txt) return;
+    try { this.onMsg(topic, JSON.parse(txt)); } catch (e) {}
+  }
+};
+Broker.prototype.send = function (bytes) { if (this.ready && this.ws.readyState === 1) { this.ws.send(bytes); return true; } return false; };
+Broker.prototype.sendSub = function (topic) { this.send(mqPacket(0x82, [0, 1].concat(mqStr(topic), [0]))); };
+Broker.prototype.subscribe = function (topic) { this.subs.push(topic); if (this.ready) this.sendSub(topic); };
+Broker.prototype.publish = function (topic, obj, retain) { return this.send(mqPacket(0x30 | (retain ? 1 : 0), mqStr(topic).concat(Array.from(enc.encode(JSON.stringify(obj)))))); };
+
+/* Net = all brokers at once: publish to every connected broker, dedupe on receive. */
+var Net = {
+  list: [],
+  start: function (onMsg) { var self = this; if (this.list.length) return; BROKERS.forEach(function (u) { self.list.push(new Broker(u, onMsg, function () { self.changed(); })); }); },
+  up: function () { return this.list.some(function (b) { return b.ready; }); },
+  subscribe: function (t) { this.list.forEach(function (b) { b.subscribe(t); }); },
+  publish: function (t, o, r) { var ok = false; this.list.forEach(function (b) { if (b.publish(t, o, r)) ok = true; }); return ok; },
+  kick: function () { this.list.forEach(function (b) { if (!b.ready && (!b.ws || b.ws.readyState > 1)) { b.retry = 1000; b.connect(); } }); },
+  changed: function () { if (this.up()) { if (!ui.upAt) ui.upAt = Date.now(); onNetUp(); } updateStatus(); }
+};
+
+/* ===== App state ===== */
+var me = load('qb_me') || { id: 'p' + rid(10), name: '' }; save('qb_me', me);
+var sess = load('qb_session');   // {code, host:bool}
+var S = null;                    // latest public state seen
+var H = null;                    // host-only private state
+var ui = { pending: [], screen: 'home', err: '', joining: false, lastState: 0, sentJoin: 0, joinStart: 0, picked: null };
+var seenActions = {};
+
+function stateTopic() { return TOPIC + sess.code + '/s'; }
+function actTopic() { return TOPIC + sess.code + '/a'; }
+
+function onMessage(topic, msg) {
+  if (!sess) return;
+  if (topic === stateTopic()) onState(msg);
+  else if (topic === actTopic() && H) { dbg('act ' + msg.type + ' ' + msg.pid); if (msg.aid && seenActions[msg.aid]) return; if (msg.aid) seenActions[msg.aid] = 1; hostHandle(msg); }
+}
+
+function onNetUp() {
+  if (!sess) return;
+  if (H) hostPublish();
+  else if (S) sendAction({ type: 'join', name: me.name });
+}
+
+/* ===== Client side ===== */
+function onState(st) {
+  if (H) return;                    // host ignores its own echoes
+  if (!st || st.code !== sess.code) return;
+  var fresh = Date.now() - st.ts < STALE_ROOM_MS;
+  if (!S && !fresh) return;         // old retained message from a dead room: ignore (not-found timer will fire)
+  if (S && st.v < S.v) { ui.lastState = Date.now(); return; }
+  var changed = !S || st.v !== S.v;
+  st.recv = Date.now(); S = st; ui.lastState = Date.now();
+  var inGame = S.players.some(function (p) { return p.id === me.id; });
+  if (!inGame) {
+    var rej = S.rejected && S.rejected[me.id];
+    if (rej || (S.players.length >= MAX_PLAYERS) || S.phase !== 'lobby') {
+      var why = rej || (S.phase !== 'lobby' ? 'started' : 'full');
+      return fail(why === 'full' ? 'Room full \u2013 this room already has 4 players.' : 'That game already started. Ask the host to Play Again or make a new room.');
+    }
+    if (Date.now() - ui.sentJoin > 3000) { ui.sentJoin = Date.now(); sendAction({ type: 'join', name: me.name }); }
+  }
+  if (changed) render();
+}
+function fail(msg) { leave(true); ui.err = msg; render(); }
+function sendAction(a) {
+  a.pid = me.id; a.aid = rid(10);
+  if (H) { seenActions[a.aid] = 1; hostHandle(a); return; }
+  ui.lastResend = Date.now();
+  Net.publish(actTopic(), a, false);
+  if (a.done) ui.pending.push(a);  // resent every 2s until the host's state shows it was applied
+}
+function resendPending() {
+  ui.pending = ui.pending.filter(function (a) { return S && a.tries++ < 30 && !a.done(S); });
+  ui.pending.forEach(function (a) { var c = {}; for (var k in a) if (k !== 'done' && k !== 'tries') c[k] = a[k]; Net.publish(actTopic(), c, false); });
+}
+
+function enterRoom(code, asHost) {
+  sess = { code: code, host: !!asHost }; save('qb_session', sess);
+  ui.err = ''; ui.joinStart = Date.now(); S = null;
+  history.replaceState(null, '', location.pathname + '?room=' + code + (QS.get('ansT') ? '&ansT=' + QS.get('ansT') : '') + (QS.get('voteT') ? '&voteT=' + QS.get('voteT') : ''));
+  Net.start(onMessage);
+  Net.subscribe(TOPIC + code + '/+');
+  if (Net.up()) onNetUp();
+  render();
+}
+function leave(silent) {
+  if (sess && !H && !silent) sendAction({ type: 'leave' });
+  if (H) save('qb_host_' + sess.code, null);
+  sess = null; S = null; H = null; save('qb_session', null);
+  history.replaceState(null, '', location.pathname);
+  render();
+}
+
+/* ===== Host side (authoritative) ===== */
+function hostCreate() {
+  var code = newCode();
+  H = { v: 1, code: code, phase: 'lobby', round: 0, players: [{ id: me.id, name: me.name, score: 0, seen: Date.now() }],
+        used: [], prompt: '', deadline: 0, answers: {}, order: [], votes: {}, results: [], rejected: {} };
+  enterRoom(code, true); hostChanged();
+}
+function hostResume() {
+  H = load('qb_host_' + sess.code);
+  if (!H) return false;
+  H.v += 1; H.players.forEach(function (p) { if (p.id !== me.id) p.seen = Date.now(); });
+  return true;
+}
+function hostChanged() { H.v++; save('qb_host_' + H.code, H); hostPublish(); render(); }
+function hostPublish() {
+  if (!H) return;
+  S = publicState(); S.recv = Date.now();
+  Net.publish(TOPIC + H.code + '/s', S, true);
+  H.lastPub = Date.now();
+}
+function online(p) { return p.id === me.id || Date.now() - p.seen < OFFLINE_MS; }
+function publicState() {
+  var st = { v: H.v, ts: Date.now(), code: H.code, host: me.id, phase: H.phase, round: H.round, total: ROUNDS, prompt: H.prompt,
+    rem: Math.max(0, H.deadline - Date.now()),
+    players: H.players.map(function (p) { return { id: p.id, name: p.name, score: p.score, on: online(p) }; }),
+    submitted: Object.keys(H.answers), voted: Object.keys(H.votes), rejected: H.rejected };
+  if (H.phase === 'vote') st.answers = H.order.map(function (id) { var a = findAns(id); return { id: id, text: a.text }; });
+  if (H.phase === 'results' || H.phase === 'final') st.results = H.results;
+  return st;
+}
+function findAns(id) { for (var k in H.answers) if (H.answers[k].id === id) { var a = H.answers[k]; a.by = k; return a; } return null; }
+function playerById(id) { return H.players.filter(function (p) { return p.id === id; })[0]; }
+
+function hostHandle(a) {
+  var p = playerById(a.pid);
+  if (p) p.seen = Date.now();
+  if (a.type === 'hi') return;
+  if (a.type === 'join') {
+    var name = String(a.name || 'Player').slice(0, 16);
+    if (p) { if (p.name !== name) { p.name = name; hostChanged(); } return; }
+    if (H.phase !== 'lobby') H.rejected[a.pid] = 'started';
+    else if (H.players.length >= MAX_PLAYERS) H.rejected[a.pid] = 'full';
+    else H.players.push({ id: a.pid, name: name, score: 0, seen: Date.now() });
+    return hostChanged();
+  }
+  if (!p) return;
+  if (a.type === 'leave' && H.phase === 'lobby') { H.players = H.players.filter(function (x) { return x !== p; }); return hostChanged(); }
+  if (a.type === 'leave') { p.seen = 0; return hostChanged(); }
+  if (a.type === 'answer' && H.phase === 'answer' && H.round === a.round && !H.answers[p.id]) {
+    var t = String(a.text || '').trim().slice(0, 120); if (!t) return;
+    H.answers[p.id] = { id: String(a.ansId).slice(0, 20), text: t }; hostCheck(); return hostChanged();
+  }
+  if (a.type === 'vote' && H.phase === 'vote' && H.round === a.round && !H.votes[p.id]) {
+    var target = findAns(a.target);
+    if (!target || target.by === p.id) return;
+    H.votes[p.id] = a.target; hostCheck(); return hostChanged();
+  }
+}
+function hostStartRound() {
+  var pool = PROMPTS.map(function (_, i) { return i; }).filter(function (i) { return H.used.indexOf(i) < 0; });
+  var pick = pool[Math.floor(Math.random() * pool.length)];
+  H.used.push(pick); H.round++; H.prompt = PROMPTS[pick];
+  H.phase = 'answer'; H.answers = {}; H.votes = {}; H.order = []; H.results = []; H.deadline = Date.now() + ANSWER_MS;
+}
+function canVote(pid) { return H.order.some(function (id) { return findAns(id).by !== pid; }); }
+function hostCheck() { // advance phase when everyone (online) is done or time ran out
+  var now = Date.now(), on = H.players.filter(online);
+  if (H.phase === 'answer') {
+    var allIn = on.every(function (p) { return H.answers[p.id]; });
+    if (allIn || now >= H.deadline) {
+      H.order = shuffle(Object.keys(H.answers).map(function (k) { return H.answers[k].id; }));
+      if (H.order.length === 0) return hostFinishRound();
+      H.phase = 'vote'; H.deadline = now + VOTE_MS; H.votes = {};
+      return true;
+    }
+  } else if (H.phase === 'vote') {
+    var allVoted = on.every(function (p) { return H.votes[p.id] || !canVote(p.id); });
+    if (allVoted || now >= H.deadline) return hostFinishRound();
+  } else if (H.phase === 'results' && now >= H.deadline) {
+    if (H.round >= ROUNDS) { H.phase = 'final'; H.deadline = 0; } else hostStartRound();
+    return true;
+  }
+  return false;
+}
+function hostFinishRound() {
+  H.results = H.order.map(function (id) {
+    var a = findAns(id), voters = Object.keys(H.votes).filter(function (v) { return H.votes[v] === id; });
+    var pl = playerById(a.by); if (pl) pl.score += voters.length * POINTS;
+    return { id: id, text: a.text, by: a.by, name: pl ? pl.name : '?', votes: voters.length,
+             voters: voters.map(function (v) { var x = playerById(v); return x ? x.name : '?'; }) };
+  }).sort(function (x, y) { return y.votes - x.votes; });
+  H.phase = 'results'; H.deadline = Date.now() + RESULTS_MS;
+  return true;
+}
+function hostStart() { if (H.players.length < 2) return; H.players.forEach(function (p) { p.score = 0; }); H.used = []; H.round = 0; H.rejected = {}; hostStartRound(); hostChanged(); }
+function hostNext() { if (H.phase === 'results') { H.deadline = 0; if (hostCheck()) hostChanged(); } }
+
+/* ===== Timers ===== */
+setInterval(function () {
+  if (H) {
+    if (hostCheck()) hostChanged();
+    else if (Date.now() - (H.lastPub || 0) > 4000) hostPublish(); // heartbeat (+ refresh online flags)
+  } else if (sess && S && S.players.some(function (p) { return p.id === me.id; }) && Date.now() - (ui.lastHi || 0) > 8000) {
+    ui.lastHi = Date.now(); sendAction({ type: 'hi' });
+  }
+  if (sess && !H && !S && Net.up() && Date.now() - Math.max(ui.joinStart, ui.upAt || 0) > NOT_FOUND_MS) {
+    var code = sess.code; fail('Room \u201c' + code + '\u201d not found. Check the code and try again.');
+  }
+  if (!H && ui.pending.length && Date.now() - (ui.lastResend || 0) > 2000) { ui.lastResend = Date.now(); resendPending(); }
+  updateStatus(); tickTimer();
+}, 500);
+document.addEventListener('visibilitychange', function () { if (!document.hidden && sess) { Net.kick(); if (H) hostPublish(); } });
+window.addEventListener('online', function () { if (sess) Net.kick(); });
+
+function timeLeft() { if (!S || !S.rem) return 0; return Math.max(0, Math.ceil((S.rem - (Date.now() - S.recv)) / 1000)); }
+function tickTimer() { var el = $('timer'); if (!el) return; var t = timeLeft(); el.textContent = '\u23f1 ' + t + 's'; el.className = 'timer' + (t <= 10 ? ' low' : ''); }
+
+function updateStatus() {
+  var el = $('status'), msg = '', cls = '';
+  if (sess) {
+    if (!Net.up()) { msg = S ? 'Reconnecting\u2026' : 'Connecting\u2026'; cls = 'warn'; }
+    else if (!H && !S) { msg = 'Looking for room ' + sess.code + '\u2026'; cls = 'ok'; }
+    else if (!H && S && Date.now() - ui.lastState > HOST_TIMEOUT) { msg = 'Host not responding\u2026 waiting for them to come back'; cls = 'err'; }
+    else if (!H && S && !S.players.some(function (p) { return p.id === me.id; })) { msg = 'Joining\u2026'; cls = 'ok'; }
+  }
+  el.textContent = msg; el.className = msg ? 'show ' + cls : '';
+}
+
+/* ===== Rendering ===== */
+function render() {
+  var ta = $('ans'), keep = ta ? ta.value : null, focused = ta && document.activeElement === ta;
+  var html;
+  if (!sess) html = homeView();
+  else if (!S || !S.players.some(function (p) { return p.id === me.id; })) html = '<h1>Quip <span>Battle</span></h1><div class="card center">Connecting to room <b>' + esc(sess.code) + '</b>\u2026</div><button class="ghost" onclick="leave()">Cancel</button>';
+  else html = ({ lobby: lobbyView, answer: answerView, vote: voteView, results: resultsView, final: finalView })[S.phase]();
+  $('app').innerHTML = html;
+  var t2 = $('ans'); if (t2 && keep != null) { t2.value = keep; if (focused) t2.focus(); }
+  tickTimer(); updateStatus();
+}
+function homeView() {
+  var room = (QS.get('room') || '').toUpperCase();
+  return '<h1>Quip <span>Battle</span></h1><p class="sub">The funniest answer wins. 2\u20134 players.</p>' +
+    (ui.err ? '<div class="err-box" id="err">' + esc(ui.err) + '</div>' : '') +
+    '<div class="card"><label for="name">Your name</label><input id="name" maxlength="16" autocomplete="nickname" placeholder="e.g. Sam" value="' + esc(me.name) + '"></div>' +
+    '<div class="card"><button id="create" onclick="doCreate()">Create Room</button></div>' +
+    '<div class="card"><label for="code">Room code</label><input id="code" maxlength="4" autocapitalize="characters" autocomplete="off" placeholder="ABCD" style="text-transform:uppercase;letter-spacing:.3em;font-weight:700" value="' + esc(room) + '">' +
+    '<button id="join" class="alt" onclick="doJoin()">Join Room</button></div>';
+}
+function readName() { var n = ($('name').value || '').trim().slice(0, 16); if (!n) { ui.err = 'Please enter your name first.'; render(); return null; } me.name = n; save('qb_me', me); return n; }
+function doCreate() { if (readName()) hostCreate(); }
+function doJoin() {
+  if (!readName()) return;
+  var c = ($('code').value || '').trim().toUpperCase().replace(/[^A-Z]/g, '');
+  if (c.length !== 4) { ui.err = 'Room codes are 4 letters.'; return render(); }
+  enterRoom(c, false);
+}
+function inviteLink() { return location.origin + location.pathname + '?room=' + S.code; }
+function shareInvite() {
+  var link = inviteLink();
+  if (navigator.share) navigator.share({ title: 'Quip Battle', text: 'Join my Quip Battle room ' + S.code, url: link }).catch(function () {});
+  else copyText(link);
+}
+function scoreList(withOnline) {
+  return '<ul class="plist">' + S.players.slice().sort(function (a, b) { return withOnline ? 0 : b.score - a.score; }).map(function (p) {
+    return '<li class="' + (p.on ? '' : 'off') + '"><span>' + esc(p.name) + (p.id === S.host ? '<span class="tag">host</span>' : '') + (p.id === me.id ? '<span class="tag">you</span>' : '') + (p.on ? '' : '<span class="tag">offline</span>') + '</span><b class="score" data-pid="' + esc(p.id) + '">' + (withOnline ? '' : p.score) + '</b></li>';
+  }).join('') + '</ul>';
+}
+function lobbyView() {
+  var n = S.players.length, isHost = !!H;
+  return '<h1>Quip <span>Battle</span></h1>' +
+    '<div class="card center"><div class="small">Room code</div><div class="code" id="roomcode">' + esc(S.code) + '</div>' +
+    '<div class="row"><button onclick="copyText(S.code)">Copy code</button><button class="alt" onclick="shareInvite()">Share link</button></div>' +
+    '<div class="small" style="margin-top:8px;word-break:break-all">' + esc(inviteLink()) + '</div></div>' +
+    '<div class="card"><h2>Players (' + n + '/' + MAX_PLAYERS + ')</h2>' + scoreList(true) + '</div>' +
+    (isHost ? '<button id="start" onclick="hostStart()"' + (n < 2 ? ' disabled' : '') + '>' + (n < 2 ? 'Need at least 2 players' : 'Start game (' + ROUNDS + ' rounds)') + '</button>'
+            : '<div class="card center" id="waiting">Waiting for host to start\u2026</div>') +
+    '<button class="ghost" onclick="leave()">Leave room</button>';
+}
+function header() { return '<div class="row small" style="margin-top:8px"><span>Round ' + S.round + ' / ' + S.total + '</span><span class="center">Room ' + esc(S.code) + '</span><span style="text-align:right" id="timer" class="timer"></span></div>'; }
+function myAnsKey() { return 'qb_ans_' + S.code + '_' + S.round; }
+function answerView() {
+  var done = S.submitted.indexOf(me.id) >= 0;
+  var waiting = S.players.filter(function (p) { return S.submitted.indexOf(p.id) < 0; }).map(function (p) { return esc(p.name); }).join(', ');
+  return header() + '<div class="card prompt" id="prompt">' + esc(S.prompt) + '</div>' +
+    (done ? '<div class="card center" id="submitted">\u2705 Answer in! Waiting for: ' + (waiting || 'nobody') + '</div>'
+          : '<div class="card"><label for="ans">Your funniest answer</label><textarea id="ans" maxlength="120" placeholder="Type something hilarious\u2026"></textarea><button id="send" onclick="submitAnswer()">Submit answer</button></div>') +
+    '<p class="small center">' + S.submitted.length + ' of ' + S.players.length + ' answered</p>';
+}
+function submitAnswer() {
+  var t = ($('ans').value || '').trim(); if (!t) return toast('Type an answer first');
+  var ansId = 'a' + rid(8), btn = $('send'); save(myAnsKey(), ansId);
+  btn.disabled = true; btn.textContent = 'Sending\u2026';
+  var r = S.round;
+  sendAction({ type: 'answer', round: r, text: t, ansId: ansId, tries: 0, done: function (st) { return st.round !== r || st.phase !== 'answer' || st.submitted.indexOf(me.id) >= 0; } });
+}
+function voteView() {
+  var mine = load(myAnsKey()), done = S.voted.indexOf(me.id) >= 0;
+  return header() + '<div class="card prompt">' + esc(S.prompt) + '</div>' +
+    '<p class="center">' + (done ? '\u2705 Vote in! Waiting for others\u2026' : 'Tap the funniest answer') + '</p><div id="answers">' +
+    S.answers.map(function (a) {
+      var own = a.id === mine;
+      return '<button class="ans' + (own ? ' mine' : '') + (ui.picked === a.id ? ' picked' : '') + '" data-id="' + esc(a.id) + '"' + (own || done ? ' disabled' : '') + ' onclick="vote(this.dataset.id)">' + esc(a.text) + (own ? ' <span class="tag">yours</span>' : '') + '</button>';
+    }).join('') + '</div><p class="small center">' + S.voted.length + ' voted</p>';
+}
+function vote(id) {
+  var r = S.round; ui.picked = id;
+  sendAction({ type: 'vote', round: r, target: id, tries: 0, done: function (st) { return st.round !== r || st.phase !== 'vote' || st.voted.indexOf(me.id) >= 0; } }); document.querySelectorAll('.ans').forEach(function (b) { b.disabled = true; }); }
+function resultsBlock() {
+  if (!S.results.length) return '<div class="card center">Nobody answered this round!</div>';
+  return S.results.map(function (r) {
+    return '<div class="res"><div>\u201c' + esc(r.text) + '\u201d</div><div class="small">by <b>' + esc(r.name) + '</b> \u2014 ' + r.votes + ' vote' + (r.votes === 1 ? '' : 's') + ' (+' + r.votes * POINTS + ')' + (r.voters.length ? ' \u00b7 from ' + r.voters.map(esc).join(', ') : '') + '</div></div>';
+  }).join('');
+}
+function resultsView() {
+  return header() + '<div class="card prompt">' + esc(S.prompt) + '</div><h2>Round results</h2><div id="results">' + resultsBlock() + '</div>' +
+    '<div class="card"><h2>Scores</h2>' + scoreList(false) + '</div>' +
+    (H ? '<button id="next" onclick="hostNext()">' + (S.round >= S.total ? 'Final scores' : 'Next round') + '</button>' : '<p class="small center">Next round starts automatically\u2026</p>');
+}
+function finalView() {
+  var top = Math.max.apply(null, S.players.map(function (p) { return p.score; }));
+  var winners = S.players.filter(function (p) { return p.score === top; }).map(function (p) { return esc(p.name); });
+  return '<h1>Final <span>Scores</span></h1><div class="winner" id="winner">\ud83c\udfc6 ' + winners.join(' & ') + (winners.length > 1 ? ' tie!' : ' wins!') + '</div>' +
+    '<div class="card" id="final">' + scoreList(false) + '</div>' +
+    '<h2>Last round</h2>' + resultsBlock() +
+    (H ? '<button id="again" onclick="hostStart()">Play again</button>' : '<p class="center small">Waiting for host to start a new game\u2026</p>') +
+    '<button class="ghost" onclick="leave()">Leave room</button>';
+}
+
+/* ===== Boot ===== */
+(function boot() {
+  var room = (QS.get('room') || '').toUpperCase();
+  if (sess && (!room || room === sess.code)) {
+    if (sess.host && hostResume()) { Net.start(onMessage); Net.subscribe(TOPIC + sess.code + '/+'); ui.joinStart = Date.now(); hostChanged(); return; }
+    if (sess.host) { save('qb_session', null); sess = null; ui.err = 'Your old room has ended.'; return render(); }
+    return enterRoom(sess.code, false);
+  }
+  sess = null; render();
+})();
+</script>
+</body>
+</html>
